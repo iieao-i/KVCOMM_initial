@@ -17,6 +17,7 @@ from KVCOMM.graph.graph import Graph
 from KVCOMM.llm.config import KVCommConfig
 from KVCOMM.tools.reader.readers import JSONLReader
 from KVCOMM.utils.globals import Time
+from KVCOMM.utils.gpu_debug import print_kvcomm_cuda_state
 from KVCOMM.utils.log import configure_logging, logger
 from KVCOMM.utils.metrics import metrics_recorder
 from datasets.gsm8k_dataset import (
@@ -109,7 +110,8 @@ async def main():
 
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{current_time}.json"
+    llm_tag = args.llm_name.replace("/", "__")
+    result_file = output_dir / f"{args.domain}_{llm_tag}_{current_time}.json"
     latency_target = str(output_dir)
 
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
@@ -226,6 +228,7 @@ async def main():
         )
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
         metrics_recorder.log_cumulative(batch_index=i_batch)
+        print_kvcomm_cuda_state(tag=f"batch_{i_batch}_end", topk=10)
 
 
 def get_kwargs(

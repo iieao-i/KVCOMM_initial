@@ -64,6 +64,7 @@ def parse_args():
     parser.add_argument("--kv-threshold", type=float, default=None, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=20, help="Maximum number of anchors for key-value memory.")
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
+    parser.add_argument("--kv-top-k", type=int, default=None, help="Top-k anchors to activate; overrides top-p selection when set.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
 
@@ -85,6 +86,7 @@ async def main():
         threshold=args.kv_threshold,
         max_anchor_num=args.kv_max_anchor_num,
         window_size=args.kv_window_size,
+        top_k=args.kv_top_k,
         thread_pool_workers=args.kv_thread_workers,
         worker_timeout=args.kv_worker_timeout,
     )
@@ -119,7 +121,9 @@ async def main():
         **eval_kwargs,
     )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{timestamp}.json"
+    # HF model ids contain "/"; must not appear raw in filenames (path separator).
+    llm_tag = args.llm_name.replace("/", "__")
+    result_file = output_dir / f"{args.domain}_{llm_tag}_{timestamp}.json"
     result_file.touch(exist_ok=True)
     payload = {
         "score": score,

@@ -18,6 +18,11 @@ from KVCOMM.llm.config import KVCommConfig
 from KVCOMM.tools.coding.python_executor import PyExecutor
 from KVCOMM.tools.reader.readers import JSONLReader
 from KVCOMM.utils.globals import Time
+from KVCOMM.utils.gpu_debug import (
+    append_kvcomm_cuda_state_csv,
+    print_kvcomm_cuda_state,
+    reset_cuda_peak_memory,
+)
 from KVCOMM.utils.log import configure_logging, logger
 from KVCOMM.utils.metrics import metrics_recorder
 
@@ -84,6 +89,27 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument(
+        "--resident-anchor-summary",
+        type=str,
+        default=None,
+        help="Path to kvreuse_anchor_summary.csv; top selected anchors from this file stay resident on GPU.",
+    )
+    parser.add_argument(
+        "--resident-anchor-top-n",
+        type=int,
+        default=None,
+        help="Number of hot anchors from --resident-anchor-summary to keep resident on GPU.",
+    )
+    parser.add_argument(
+        "--test-time",
+        "--test_time",
+        nargs="?",
+        const=True,
+        default=False,
+        type=lambda value: str(value).lower() in {"1", "true", "yes", "y", "on"},
+        help="Run kv_reuse calls through the dense-vs-KV timing comparison path.",
+    )
 
     args = parser.parse_args()
     if len(args.agent_names) != len(args.agent_nums):
@@ -100,7 +126,8 @@ async def main():
 
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{current_time}.json"
+    llm_tag = args.llm_name.replace("/", "__")
+    result_file = output_dir / f"{args.domain}_{llm_tag}_{current_time}.json"
     latency_target = str(output_dir)
 
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
@@ -114,9 +141,23 @@ async def main():
             window_size=args.kv_window_size,
             thread_pool_workers=args.kv_thread_workers,
             worker_timeout=args.kv_worker_timeout,
+            resident_anchor_summary=args.resident_anchor_summary,
+            resident_anchor_top_n=args.resident_anchor_top_n,
         )
     else:
         kv_config = KVCommConfig.from_env()
+
+    logger.info(
+        "HumanEval run config: execution_mode={} threshold={} max_anchor_num={} window_size={} top_k={} test_time={} resident_anchor_summary={} resident_anchor_top_n={} anchor_device=cpu",
+        args.execution_mode,
+        kv_config.threshold,
+        kv_config.max_anchor_num,
+        kv_config.window_size,
+        kv_config.top_k,
+        args.test_time,
+        kv_config.resident_anchor_summary,
+        kv_config.resident_anchor_top_n,
+    )
 
     graph = Graph(
         domain=args.domain,
@@ -132,6 +173,13 @@ async def main():
 
     for i_batch in range(num_batches):
         logger.opt(colors=True).info(f"<blue>[BATCH]</blue> {i_batch} {'-' * 40}")
+        reset_cuda_peak_memory()
+        append_kvcomm_cuda_state_csv(
+            output_dir,
+            tag=f"batch_{i_batch}_start",
+            batch_index=i_batch,
+            phase="batch_start",
+        )
         start_ts = time.time()
         current_batch = dataloader(dataset, args.batch_size, i_batch)
         if not current_batch:
@@ -152,7 +200,8 @@ async def main():
             if args.execution_mode == "allow_kv_reuse":
                 mode_kwargs = {
                     "prefix": args.prefix,
-                    "output_dir": latency_target
+                    "output_dir": latency_target,
+                    "test_time": args.test_time,
                 }
 
             tasks.append(
@@ -210,6 +259,13 @@ async def main():
         )
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
         metrics_recorder.log_cumulative(batch_index=i_batch)
+        append_kvcomm_cuda_state_csv(
+            output_dir,
+            tag=f"batch_{i_batch}_end",
+            batch_index=i_batch,
+            phase="batch_end",
+        )
+        print_kvcomm_cuda_state(tag=f"batch_{i_batch}_end", topk=10)
 
 def get_kwargs(
     mode: Union[
