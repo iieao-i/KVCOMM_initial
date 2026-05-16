@@ -34,7 +34,7 @@ from KVCOMM.llm.llm_registry import LLMRegistry
 from KVCOMM.llm.config import KVCommConfig
 
 from KVCOMM.llm.token_ops import *
-from KVCOMM.llm.kvcomm_engine import KVCOMMEngine, _RequestState
+from KVCOMM.llm.kvcomm_engine import KVCOMMEngine, _RequestState, _move_tensor_tree
 from KVCOMM.utils.metrics import GenerationResult
 from KVCOMM.utils.log import logger
 
@@ -46,6 +46,26 @@ def _escape_loguru_markup(text: Optional[str]) -> str:
     if text is None:
         return ""
     return text.replace("<", "\\<")
+
+
+def _hf_model_load_kwargs(model_name: str) -> Tuple[torch.dtype, Optional[str]]:
+    """torch_dtype and device_map for local HF load.
+
+    Non-Llama models previously defaulted to float32 on CUDA, which roughly
+    doubles VRAM versus fp16/bf16 and commonly OOMs 7B-class weights on 24GB
+    cards during from_pretrained. device_map uses ``auto`` so visible GPUs
+    (e.g. via CUDA_VISIBLE_DEVICES) are used without hard-coding cuda:0.
+    """
+    if torch.cuda.is_available():
+        mn = model_name.lower()
+        if "llama" in mn:
+            dtype = torch.float16
+        elif torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+        return dtype, "auto"
+    return torch.float32, None
 
 
 _LATENCY_IO_LOCK = threading.Lock()
@@ -214,6 +234,8 @@ class LLMChat(LLM):
         self.model_name = model_name
 
         self.config = (config or KVCommConfig.from_env()).validate()
+        self.anchor_device = torch.device("cpu")
+        self.kv_storage_device = torch.device("cpu")
         self._ensure_thread_pool(self.config.thread_pool_workers)
         self.kv_engine = KVCOMMEngine(self)
 
@@ -550,6 +572,13 @@ class LLMChat(LLM):
         store.setdefault("input_drop_num", {})
         return store
 
+    def _offload_kv_payload(self, value: Any) -> Any:
+        """Store shared KV payloads on CPU; callers materialize copies for compute."""
+        return _move_tensor_tree(value, self.kv_storage_device)
+
+    def _materialize_kv_payload(self, value: Any) -> Any:
+        return _move_tensor_tree(value, self.model.device)
+
     def has_prefix_initialized(self, agent_id: str) -> bool:
         """Check if prefix KV has been initialized for an agent."""
         return LLMChat._initialization.get(agent_id, False)
@@ -627,14 +656,6 @@ class LLMChat(LLM):
         condition_cache = generated.past_key_values
 
 
-        for key_name, value in (
-            ("condition", condition_cache),
-            ("condition_ids", token_ids),
-            ("condition_drop_num", drop_num),
-        ):
-            bucket = owner_memory.setdefault(key_name, {})
-            bucket.setdefault(message, []).append(value)
-
         anchor_store = state.anchors.setdefault(anchor_key, {})
         cond_anchor_list = list(anchor_store.values())
         cond_len_bucket = state.anchor_len_dict.setdefault(anchor_key, {})
@@ -654,7 +675,23 @@ class LLMChat(LLM):
             anchor_kv_cache_list=cond_anchor_list,
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_activated_list,
+            request_uid=request_uid,
+            ph_id=anchor_key,
+            message=message,
+            anchor_labels=list(anchor_store.keys()),
+            log_events=True,
         )
+
+        for key_name, value in (
+            ("condition", condition_cache),
+            ("condition_ids", token_ids),
+            ("condition_drop_num", drop_num),
+        ):
+            bucket = owner_memory.setdefault(key_name, {})
+            if key_name.endswith("_drop_num"):
+                bucket.setdefault(message, []).append(value)
+            else:
+                bucket.setdefault(message, []).append(self._offload_kv_payload(value))
 
         cond_flag_bucket = state.anchor_dict.setdefault(anchor_key, {})
         cond_flag_bucket[message] = prob
@@ -771,13 +808,6 @@ class LLMChat(LLM):
             )
         input_cache = output.past_key_values
 
-        global_buckets = self._ensure_global_input_buckets()
-        global_buckets["input"].setdefault(message, []).append(
-            input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
-        )
-        global_buckets["input_ids"].setdefault(message, []).append(token_ids)
-        global_buckets["input_drop_num"].setdefault(message, []).append(drop_num)
-
         anchor_store = state.anchors.setdefault(anchor_namespace, {})
         input_anchor_list = list(anchor_store.values())
         uq_len_bucket = state.anchor_len_dict.setdefault(anchor_namespace, {})
@@ -798,10 +828,24 @@ class LLMChat(LLM):
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_activated_list,
             test_time=test_time,
+            request_uid=request_uid,
+            ph_id=anchor_namespace,
+            message=message,
+            anchor_labels=list(anchor_store.keys()),
+            log_events=True,
         )
         logger.opt(colors=True).debug(
             f"<magenta>Anchor prediction for input '{safe_message}'</magenta>: {prob}"
         )
+
+        global_buckets = self._ensure_global_input_buckets()
+        global_buckets["input"].setdefault(message, []).append(
+            self._offload_kv_payload(
+                input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
+            )
+        )
+        global_buckets["input_ids"].setdefault(message, []).append(self._offload_kv_payload(token_ids))
+        global_buckets["input_drop_num"].setdefault(message, []).append(drop_num)
 
         state.anchor_dict.setdefault(anchor_namespace, {})[message] = prob
         global_bucket = state.global_anchor_info.setdefault(anchor_namespace, {})
@@ -836,6 +880,7 @@ class LLMChat(LLM):
     ) -> GenerationResult:
         """Generate a response using the requested strategy with sensible fallbacks."""
         latency_target = output_dir or kwargs.get("output_dir")
+        self.kv_engine.configure_anchor_event_logging(latency_target)
         if preferred_mode == "dense_prefill":
             mode = "dense_prefill"
         elif self.has_active_anchor(request_uid, message):
@@ -918,8 +963,8 @@ class LLMChat(LLM):
 
             if type_ == "text":
                 seg_kv = base_kv.slice(start=s, end=e)
-                segment_kv_list.append(seg_kv)
-                token_id_list.append(token_id)
+                segment_kv_list.append(self._offload_kv_payload(seg_kv))
+                token_id_list.append(self._offload_kv_payload(token_id))
         self._shared_kv_cache_memory[node_id]["prefix"] = LLMChat._shared_kv_cache_memory[node_id]["prefix"] = segment_kv_list          
         self._shared_kv_cache_memory[node_id]["placeholder_info"] = LLMChat._shared_kv_cache_memory[node_id]["placeholder_info"] = placeholder_info
         self._shared_kv_cache_memory[node_id]["token_ids"] = LLMChat._shared_kv_cache_memory[node_id]["token_ids"] = token_id_list            
@@ -931,11 +976,12 @@ class LLMChat(LLM):
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                load_dtype, device_map = _hf_model_load_kwargs(self.model_name)
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16 if 'llama' in self.model_name else torch.float32,
+                    torch_dtype=load_dtype,
                     low_cpu_mem_usage=True,
-                    device_map="cuda:0",
+                    device_map=device_map,
                     trust_remote_code=True
                 )
                 logger.info("Model {} loaded and shared across instances.", self.model_name)
@@ -1194,8 +1240,14 @@ class LLMChat(LLM):
             message = messages
 
         prefix_store = self._shared_kv_cache_memory[self.node_id]
-        prefix_kv_list: List[DynamicCache] = prefix_store.get("prefix", [])
-        prefix_token_ids: List[Dict[str, torch.Tensor]] = prefix_store.get("token_ids", [])
+        prefix_kv_list: List[DynamicCache] = [
+            self._materialize_kv_payload(cache)
+            for cache in prefix_store.get("prefix", [])
+        ]
+        prefix_token_ids: List[Dict[str, torch.Tensor]] = [
+            self._materialize_kv_payload(token_ids)
+            for token_ids in prefix_store.get("token_ids", [])
+        ]
         placeholder_info_map = prefix_store.get("placeholder_info")
         if not prefix_kv_list:
             raise RuntimeError(
@@ -1370,12 +1422,14 @@ class LLMChat(LLM):
         ]
         anchor_active_list: List[int] = list(anchor_info_bucket.values())
 
-        resp.setdefault(message, []).append(response_kv_cache)
+        resp.setdefault(message, []).append(self._offload_kv_payload(response_kv_cache))
         resp_ids.setdefault(message, []).append(
-            {
-                "input_ids": response_tokens,
-                "attention_mask": response_mask,
-            }
+            self._offload_kv_payload(
+                {
+                    "input_ids": response_tokens,
+                    "attention_mask": response_mask,
+                }
+            )
         )
         resp_drop.setdefault(message, []).append(0)
 
@@ -1390,6 +1444,11 @@ class LLMChat(LLM):
             anchor_kv_cache_list=response_anchor_list,
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_active_list,
+            request_uid=request_uid,
+            ph_id=current_key,
+            message=message,
+            anchor_labels=list(anchor_bucket.keys()),
+            log_events=True,
         )
         safe_message = _escape_loguru_markup(message)
         logger.opt(colors=True).debug(
@@ -1502,8 +1561,14 @@ class LLMChat(LLM):
             message = messages
 
         prefix_store = self._shared_kv_cache_memory[self.node_id]
-        prefix_kv_list: List[DynamicCache] = prefix_store.get("prefix", [])
-        prefix_token_ids: List[Dict[str, torch.Tensor]] = prefix_store.get("token_ids", [])
+        prefix_kv_list: List[DynamicCache] = [
+            self._materialize_kv_payload(cache)
+            for cache in prefix_store.get("prefix", [])
+        ]
+        prefix_token_ids: List[Dict[str, torch.Tensor]] = [
+            self._materialize_kv_payload(token_ids)
+            for token_ids in prefix_store.get("token_ids", [])
+        ]
         placeholder_info_map = prefix_store.get("placeholder_info")
         if not prefix_kv_list:
             raise RuntimeError(
@@ -1649,6 +1714,26 @@ class LLMChat(LLM):
             ttft_value = kvcomm_ttft_value
         else:
             ttft_value = dense_prefill_ttft
+        if mode == "dense_prefill":
+            base_cache = merged_prefix_kv
+            real_cache = full_kv_cache.slice(start=0, end=prefix_token_length)
+            real_placeholder_cache, real_prefix_cache = real_cache.split_cache_by_placeholders(
+                placeholder_indices
+            )
+            base_placeholder_cache, base_prefix_cache = base_cache.split_cache_by_placeholders(
+                placeholder_indices
+            )
+            self.kv_engine.set_anchor(
+                request_uid,
+                message,
+                ph_id_list,
+                real_placeholder_cache,
+                real_prefix_cache,
+                base_placeholder_cache,
+                base_prefix_cache,
+                max_anchor_num=max_anchor_num,
+                window_length=window_length,
+            )
         response_kv_cache = full_kv_cache.slice_(start=prefix_token_length)
         response_kv_cache = self.kv_engine.apply_rotary_pos_emb(
             response_kv_cache,
@@ -1676,12 +1761,14 @@ class LLMChat(LLM):
         ]
         anchor_active_list: List[int] = list(anchor_info_bucket.values())
 
-        resp.setdefault(message, []).append(response_kv_cache)
+        resp.setdefault(message, []).append(self._offload_kv_payload(response_kv_cache))
         resp_ids.setdefault(message, []).append(
-            {
-                "input_ids": response_tokens,
-                "attention_mask": response_mask,
-            }
+            self._offload_kv_payload(
+                {
+                    "input_ids": response_tokens,
+                    "attention_mask": response_mask,
+                }
+            )
         )
         resp_drop.setdefault(message, []).append(0)
 
@@ -1697,6 +1784,11 @@ class LLMChat(LLM):
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_active_list,
             test_time=True,
+            request_uid=request_uid,
+            ph_id=current_key,
+            message=message,
+            anchor_labels=list(anchor_bucket.keys()),
+            log_events=True,
         )
         safe_message = _escape_loguru_markup(message)
         logger.opt(colors=True).debug(

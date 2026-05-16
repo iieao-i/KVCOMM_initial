@@ -9,9 +9,11 @@ prefill.
 from __future__ import annotations
 
 import copy
+import csv
 import threading
 from collections.abc import MutableMapping
 from collections.abc import Sequence
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -407,6 +409,21 @@ def _to_device(cache: DynamicCache, device: Union[str, torch.device]) -> Dynamic
     return cache
 
 
+def _move_tensor_tree(value: Any, device: Union[str, torch.device]) -> Any:
+    """Recursively move tensors/cache payloads to the target device."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device)
+    if isinstance(value, DynamicCache):
+        return value.copy().to(device)
+    if isinstance(value, dict):
+        return {key: _move_tensor_tree(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_tensor_tree(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensor_tree(item, device) for item in value)
+    return copy.deepcopy(value) if isinstance(value, set) else value
+
+
 def _split_cache_by_placeholders(
     cache: DynamicCache,
     placeholder_dict: Dict[str, Tuple[int, int]],
@@ -535,6 +552,21 @@ def _clone_default(value: Any) -> Any:
     return copy.copy(value) if hasattr(value, "__copy__") else value
 
 
+def _scoped_copy(value: Any) -> Any:
+    """Deep-copy request state while sharing explicitly resident GPU anchors."""
+    if isinstance(value, dict):
+        if value.get("_kvcomm_resident_anchor") is True:
+            return value
+        return {key: _scoped_copy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scoped_copy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scoped_copy(item) for item in value)
+    if isinstance(value, set):
+        return {_scoped_copy(item) for item in value}
+    return copy.deepcopy(value)
+
+
 class _ScopedDict(MutableMapping):
     """Request-scoped view over a shared dictionary with deferred commits."""
 
@@ -546,7 +578,7 @@ class _ScopedDict(MutableMapping):
         if key in self._local:
             return
         if key in self._base:
-            self._local[key] = copy.deepcopy(self._base[key])
+            self._local[key] = _scoped_copy(self._base[key])
 
     def __getitem__(self, key: str) -> Any:
         if key in self._local:
@@ -555,7 +587,7 @@ class _ScopedDict(MutableMapping):
                 raise KeyError(key)
             return value
         if key in self._base:
-            value = copy.deepcopy(self._base[key])
+            value = _scoped_copy(self._base[key])
             self._local[key] = value
             if value is _DELETED:
                 raise KeyError(key)
@@ -605,7 +637,7 @@ class _ScopedDict(MutableMapping):
                 return new_value
             return value
         if key in self._base:
-            value = copy.deepcopy(self._base[key])
+            value = _scoped_copy(self._base[key])
             self._local[key] = value
             return value
         new_value = _clone_default(default)
@@ -686,13 +718,195 @@ class KVCOMMEngine:
     _request_states: Dict[str, _RequestState] = {}
     _active_requests: set[str] = set()
     _staged_commits: List[_RequestState] = []
+    _anchor_event_lock = threading.Lock()
+    _anchor_event_step = 0
+    _anchor_event_csv_path: Optional[Path] = None
+    _anchor_lifecycle_step = 0
+    _anchor_lifecycle_csv_path: Optional[Path] = None
+    _resident_anchor_keys: set[Tuple[str, str]] = set()
+    _resident_anchor_source: Optional[Tuple[str, int]] = None
 
     def __init__(self, llm: "LLMChat"):
         self.llm = llm
         self._warning_prefix = "[KVCOMMEngine]"
+        self.configure_resident_anchors_from_config()
 
     def _log_warning(self, message: str) -> None:
         logger.opt(colors=True).warning("<yellow>{}</yellow> {}", self._warning_prefix, message)
+
+    @classmethod
+    def configure_anchor_event_logging(cls, output_dir: Optional[Union[str, Path]]) -> None:
+        """Configure output csv path for KVReuse anchor diagnostics."""
+        if output_dir is None:
+            return
+        out_dir = Path(output_dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with cls._anchor_event_lock:
+            cls._anchor_event_csv_path = out_dir / "kvreuse_anchor_events.csv"
+            cls._anchor_lifecycle_csv_path = out_dir / "kvreuse_anchor_lifecycle.csv"
+
+    @classmethod
+    def _next_anchor_event_step(cls) -> int:
+        with cls._anchor_event_lock:
+            cls._anchor_event_step += 1
+            return cls._anchor_event_step
+
+    @classmethod
+    def _write_anchor_event_rows(cls, rows: List[Dict[str, Any]]) -> None:
+        csv_path = cls._anchor_event_csv_path
+        if csv_path is None or not rows:
+            return
+        fieldnames = [
+            "step",
+            "request_uid",
+            "ph_id",
+            "message",
+            "anchor_msg",
+            "is_candidate",
+            "is_selected",
+            "sim_score",
+            "weight",
+            "skip_reason",
+            "placeholder_len",
+            "available_anchor_num",
+            "selected_anchor_num",
+        ]
+        with cls._anchor_event_lock:
+            file_exists = csv_path.exists()
+            with csv_path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    @classmethod
+    def _next_anchor_lifecycle_step(cls) -> int:
+        with cls._anchor_event_lock:
+            cls._anchor_lifecycle_step += 1
+            return cls._anchor_lifecycle_step
+
+    @classmethod
+    def _write_anchor_lifecycle_row(cls, row: Dict[str, Any]) -> None:
+        csv_path = cls._anchor_lifecycle_csv_path
+        if csv_path is None:
+            return
+        fieldnames = [
+            "lifecycle_step",
+            "event",
+            "request_uid",
+            "ph_id",
+            "message",
+            "node_id",
+            "role",
+            "frequency",
+            "placeholder_len",
+            "accumulate_len",
+            "anchor_count_before",
+            "anchor_count_after",
+            "reason",
+        ]
+        with cls._anchor_event_lock:
+            file_exists = csv_path.exists()
+            with csv_path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    def _anchor_storage_device(self) -> torch.device:
+        device = getattr(self.llm, "anchor_device", None)
+        if device is None:
+            return torch.device("cpu")
+        return torch.device(device)
+
+    def _compute_device(self) -> torch.device:
+        return torch.device(self.llm.model.device)
+
+    def _materialize_anchor_entries(
+        self,
+        anchor_entries: List[Dict[str, Any]],
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> List[Dict[str, Any]]:
+        target_device = torch.device(device) if device is not None else self._compute_device()
+        return [_move_tensor_tree(entry, target_device) for entry in anchor_entries]
+
+    def _offload_anchor_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        return _move_tensor_tree(entry, self._anchor_storage_device())
+
+    @classmethod
+    def configure_resident_anchors(
+        cls,
+        summary_path: Optional[Union[str, Path]],
+        top_n: int,
+    ) -> None:
+        """Load the fixed hot-anchor set that should stay resident on GPU."""
+        if not summary_path or top_n <= 0:
+            cls._resident_anchor_keys = set()
+            cls._resident_anchor_source = None
+            return
+
+        path = Path(summary_path).expanduser()
+        source = (str(path), int(top_n))
+        if cls._resident_anchor_source == source:
+            return
+
+        rows: List[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    rows.append(row)
+        except OSError as exc:
+            logger.opt(colors=True).warning(
+                "<yellow>[KVCOMMEngine]</yellow> Failed to load resident anchor summary {}: {}",
+                path,
+                exc,
+            )
+            cls._resident_anchor_keys = set()
+            cls._resident_anchor_source = source
+            return
+
+        def _selected_count(row: Dict[str, Any]) -> int:
+            try:
+                return int(float(row.get("selected_count", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        rows.sort(key=_selected_count, reverse=True)
+        selected = rows[:top_n]
+        cls._resident_anchor_keys = {
+            (row.get("ph_id", ""), row.get("anchor_msg", ""))
+            for row in selected
+            if row.get("ph_id") and row.get("anchor_msg")
+        }
+        cls._resident_anchor_source = source
+        logger.opt(colors=True).info(
+            "<green>[KVCOMMEngine]</green> Loaded {} resident hot anchors from {} (top_n={})",
+            len(cls._resident_anchor_keys),
+            path,
+            top_n,
+        )
+
+    def configure_resident_anchors_from_config(self) -> None:
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return
+        self.configure_resident_anchors(
+            getattr(config, "resident_anchor_summary", None),
+            int(getattr(config, "resident_anchor_top_n", 0) or 0),
+        )
+
+    def _is_resident_anchor(self, ph_id: str, message: str) -> bool:
+        return (ph_id, message) in self._resident_anchor_keys
+
+    def _store_anchor_entry(self, ph_id: str, message: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+        if self._is_resident_anchor(ph_id, message):
+            resident_entry = _move_tensor_tree(entry, self._compute_device())
+            resident_entry["_kvcomm_resident_anchor"] = True
+            return resident_entry
+        return self._offload_anchor_entry(entry)
 
     @staticmethod
     def _stack_cache_tensors(cache: DynamicCache) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -788,7 +1002,7 @@ class KVCOMMEngine:
             return None
         if entry.get("anchor_signature") != signature:
             return None
-        return entry
+        return _move_tensor_tree(entry, self._compute_device())
 
     def _set_cached_anchor_weights(
         self,
@@ -800,7 +1014,7 @@ class KVCOMMEngine:
         """Store computed anchor weights for reuse within the same request."""
         state = self.resolve_request_state(request_uid)
         bucket = state.weight_dict.setdefault(ph_id, {})
-        bucket[message] = entry
+        bucket[message] = _move_tensor_tree(entry, self._anchor_storage_device())
 
     @staticmethod
     def _select_anchor_indices(anchor_list: List[Dict[str, Any]], placeholder_len: int) -> List[int]:
@@ -884,6 +1098,7 @@ class KVCOMMEngine:
         real_key_embedding, real_value_embedding = self._stack_cache_tensors(base_placeholder_cache)
 
         anchor_signature = self.anchor_signature(anchor_list)
+        anchor_list_on_device = self._materialize_anchor_entries(anchor_list)
 
         cache_entry = self._get_cached_anchor_weights(
             request_uid,
@@ -893,7 +1108,7 @@ class KVCOMMEngine:
         )
 
         if cache_entry is None:
-            anchor_index = self._select_anchor_indices(anchor_list, placeholder_len)
+            anchor_index = self._select_anchor_indices(anchor_list_on_device, placeholder_len)
             if not anchor_index:
                 if anchor_list:
                     self._log_warning(
@@ -902,7 +1117,7 @@ class KVCOMMEngine:
                 return base_placeholder_cache.copy(), base_prefix_cache.copy()
 
             cache_entry = self._compute_anchor_weight_entry(
-                anchor_list,
+                anchor_list_on_device,
                 anchor_index,
                 real_key_embedding,
                 real_value_embedding,
@@ -925,14 +1140,14 @@ class KVCOMMEngine:
         weights_value_for_placeholder = cache_entry["weights_value_for_placeholder"]
 
         prefix_key_delta_stack = torch.stack(
-            [anchor_list[i][f"{self.llm.node_id}_pf_key_delta"] for i in anchor_index]
+            [anchor_list_on_device[i][f"{self.llm.node_id}_pf_key_delta"] for i in anchor_index]
         )
         layer_total_delta_key_for_prefix = (
             weights_key_for_prefix * prefix_key_delta_stack
         ).sum(0)
 
         prefix_value_delta_stack = torch.stack(
-            [anchor_list[i][f"{self.llm.node_id}_pf_value_delta"] for i in anchor_index]
+            [anchor_list_on_device[i][f"{self.llm.node_id}_pf_value_delta"] for i in anchor_index]
         )
         layer_total_value_delta_for_prefix = (
             weights_value_for_prefix * prefix_value_delta_stack
@@ -940,7 +1155,7 @@ class KVCOMMEngine:
 
         placeholder_key_delta_stack = torch.stack(
             [
-                anchor_list[i][f"{self.llm.node_id}_ph_key_delta"][..., :placeholder_len, :]
+                anchor_list_on_device[i][f"{self.llm.node_id}_ph_key_delta"][..., :placeholder_len, :]
                 for i in anchor_index
             ]
         )
@@ -950,7 +1165,7 @@ class KVCOMMEngine:
 
         placeholder_value_delta_stack = torch.stack(
             [
-                anchor_list[i][f"{self.llm.node_id}_ph_value_delta"][..., :placeholder_len, :]
+                anchor_list_on_device[i][f"{self.llm.node_id}_ph_value_delta"][..., :placeholder_len, :]
                 for i in anchor_index
             ]
         )
@@ -995,11 +1210,86 @@ class KVCOMMEngine:
         anchor_len_list: List[Tuple[int, int]],
         anchor_activated_list: List[int],
         top_p: float = 0.9,
+        top_k: Optional[int] = None,
         entropy_eps: float = 1e-40,
         test_time: bool = False,
+        request_uid: str = "",
+        ph_id: str = "",
+        message: str = "",
+        anchor_labels: Optional[List[str]] = None,
+        log_events: bool = False,
     ) -> Tuple[bool, List[int]]:
+        step = self._next_anchor_event_step() if log_events else -1
+        label_list = anchor_labels if anchor_labels is not None else [""] * len(anchor_kv_cache_list)
+
+        def _emit_events(
+            *,
+            available: List[int],
+            selected: List[int],
+            sim_values: Optional[torch.Tensor],
+            skip_reason: str = "none",
+            placeholder_len: int = 0,
+        ) -> None:
+            if not log_events:
+                return
+            selected_set = set(selected)
+            rows: List[Dict[str, Any]] = []
+            if not available:
+                rows.append(
+                    {
+                        "step": step,
+                        "request_uid": request_uid,
+                        "ph_id": ph_id,
+                        "message": message,
+                        "anchor_msg": "__none__",
+                        "is_candidate": 0,
+                        "is_selected": 0,
+                        "sim_score": "",
+                        "weight": "",
+                        "skip_reason": skip_reason,
+                        "placeholder_len": placeholder_len,
+                        "available_anchor_num": 0,
+                        "selected_anchor_num": 0,
+                    }
+                )
+                self._write_anchor_event_rows(rows)
+                return
+
+            for idx, anchor_idx in enumerate(available):
+                sim_val = (
+                    float(sim_values[idx].detach().cpu().item())
+                    if sim_values is not None and idx < sim_values.shape[0]
+                    else ""
+                )
+                row_skip_reason = skip_reason if skip_reason != "none" else "none"
+                rows.append(
+                    {
+                        "step": step,
+                        "request_uid": request_uid,
+                        "ph_id": ph_id,
+                        "message": message,
+                        "anchor_msg": label_list[anchor_idx] if anchor_idx < len(label_list) else "",
+                        "is_candidate": 1,
+                        "is_selected": 1 if anchor_idx in selected_set else 0,
+                        "sim_score": sim_val,
+                        "weight": sim_val if anchor_idx in selected_set else "",
+                        "skip_reason": row_skip_reason,
+                        "placeholder_len": placeholder_len,
+                        "available_anchor_num": len(available),
+                        "selected_anchor_num": len(selected),
+                    }
+                )
+            self._write_anchor_event_rows(rows)
+
         if len(anchor_kv_cache_list) in [0, 1]:
+            _emit_events(
+                available=[],
+                selected=[],
+                sim_values=None,
+                skip_reason="insufficient_anchors",
+            )
             return True, anchor_activated_list
+        anchor_kv_cache_list = self._materialize_anchor_entries(anchor_kv_cache_list)
 
         if test_time:
             torch.cuda.synchronize()
@@ -1011,6 +1301,13 @@ class KVCOMMEngine:
             self._log_warning(
                 "The length of anchor_len_list is not equal to the length of anchor_available, "
                 f"with {len(anchor_len_list)} and {len(anchor_available)}."
+            )
+            _emit_events(
+                available=[],
+                selected=[],
+                sim_values=None,
+                skip_reason="len_mismatch",
+                placeholder_len=k,
             )
             return True, anchor_activated_list
 
@@ -1028,6 +1325,13 @@ class KVCOMMEngine:
                     f"<yellow>Entropy {entropy:.4f} exceeds threshold {threshold * torch.log2(torch.tensor(sim.shape[0])):.4f}, "
                     "skip activating anchors.</yellow>"
                 )
+                _emit_events(
+                    available=anchor_available,
+                    selected=[],
+                    sim_values=sim,
+                    skip_reason="entropy_skip",
+                    placeholder_len=k,
+                )
                 if test_time:
                     torch.cuda.synchronize()
                     end_time = perf_counter()
@@ -1036,10 +1340,19 @@ class KVCOMMEngine:
                     )
                 return True, anchor_activated_list
             sorted_sim, sorted_indices = torch.sort(sim, descending=True)
-            cumulative_sum = torch.cumsum(sorted_sim, dim=0)
-            cutoff_index_candidates = (cumulative_sum < top_p).nonzero(as_tuple=True)[0]
-            cutoff_index = cutoff_index_candidates[-1] if len(cutoff_index_candidates) > 0 else len(sorted_sim) - 1
-            selected_indices = sorted_indices[:cutoff_index + 1]
+            effective_top_k = self.llm.config.top_k if top_k is None else top_k
+            if effective_top_k is not None:
+                selected_indices = sorted_indices[: min(effective_top_k, len(sorted_indices))].tolist()
+            else:
+                cumulative_sum = torch.cumsum(sorted_sim, dim=0)
+                cutoff_index_candidates = (cumulative_sum < top_p).nonzero(as_tuple=True)[0]
+                cutoff_index = cutoff_index_candidates[-1] if len(cutoff_index_candidates) > 0 else len(sorted_sim) - 1
+                selected_indices = sorted_indices[:cutoff_index + 1].tolist()
+            selected_anchor_indices = [
+                anchor_available[i]
+                for i in selected_indices
+                if i < len(anchor_available)
+            ]
             for i in selected_indices:
                 if anchor_available[i] >= len(anchor_activated_list):
                     self._log_warning(
@@ -1049,6 +1362,13 @@ class KVCOMMEngine:
                     )
                     continue
                 anchor_activated_list[anchor_available[i]] += 1
+            _emit_events(
+                available=anchor_available,
+                selected=selected_anchor_indices,
+                sim_values=sim,
+                skip_reason="none",
+                placeholder_len=k,
+            )
             if test_time:
                 torch.cuda.synchronize()
                 end_time = perf_counter()
@@ -1057,6 +1377,13 @@ class KVCOMMEngine:
                 )
             return False, anchor_activated_list
         logger.opt(colors=True).debug("<yellow>No available anchors to activate.</yellow>")
+        _emit_events(
+            available=anchor_available,
+            selected=[],
+            sim_values=None,
+            skip_reason="no_available",
+            placeholder_len=k,
+        )
         return True, anchor_activated_list
 
     def update_anchor(self, request_uid: str, ph_id: str, window_length: int = 5) -> None:
@@ -1066,15 +1393,35 @@ class KVCOMMEngine:
         state = self.resolve_request_state(request_uid)
         anchor_store = state.anchors.setdefault(ph_id, {})
         anchor_info_dict = state.anchor_info_dict.setdefault(ph_id, {})
-        info_list = list(anchor_info_dict.values())[:window_length]
-        if not info_list:
+        info_items = list(anchor_info_dict.items())[:window_length]
+        removable_items = [
+            item
+            for item in info_items
+            if not self._is_resident_anchor(ph_id, item[0])
+        ]
+        if not removable_items:
             return
-        min_idx = info_list.index(min(info_list))
-        message = list(anchor_info_dict.keys())[min_idx]
+        message, _ = min(removable_items, key=lambda item: item[1])
+        anchor_count_before = len(anchor_store)
         anchor_store.pop(message, None)
         state.anchor_len_dict.setdefault(ph_id, {}).pop(message, None)
         freq = anchor_info_dict.pop(message, None)
         state.global_anchor_info.setdefault(ph_id, {}).pop(message, None)
+        self._write_anchor_lifecycle_row(
+            {
+                "lifecycle_step": self._next_anchor_lifecycle_step(),
+                "event": "remove",
+                "request_uid": request_uid,
+                "ph_id": ph_id,
+                "message": message,
+                "node_id": self.llm.node_id,
+                "role": self.llm.role,
+                "frequency": freq,
+                "anchor_count_before": anchor_count_before,
+                "anchor_count_after": len(anchor_store),
+                "reason": f"low_frequency_in_oldest_window_{window_length}",
+            }
+        )
         self._log_warning(
             f"Removed anchor for message '{message}' in {self.llm.node_id} ({self.llm.role}) due to low frequency: {freq}"
         )
@@ -1143,12 +1490,13 @@ class KVCOMMEngine:
             if i not in anchor_dict:
                 accumulate_len += placeholder_len
                 continue
-            entry = anchor_dict[i]
+            entry = self._store_anchor_entry(ph_id_list[i], message, anchor_dict[i])
             over_store = len(anchor_store.setdefault(ph_id_list[i], {})) > max_anchor_num
             if over_store:
                 self.update_anchor(request_uid, ph_id_list[i], window_length)
 
             if message not in anchor_store[ph_id_list[i]]:
+                anchor_count_before = len(anchor_store[ph_id_list[i]])
                 anchor_store[ph_id_list[i]][message] = entry
                 info_bucket = state.anchor_info_dict.setdefault(ph_id_list[i], {})
                 info_bucket[message] = 0
@@ -1162,6 +1510,23 @@ class KVCOMMEngine:
                 state.global_anchor_info.setdefault(ph_id_list[i], {}).setdefault(
                     message,
                     [0, placeholder_len],
+                )
+                self._write_anchor_lifecycle_row(
+                    {
+                        "lifecycle_step": self._next_anchor_lifecycle_step(),
+                        "event": "add",
+                        "request_uid": request_uid,
+                        "ph_id": ph_id_list[i],
+                        "message": message,
+                        "node_id": self.llm.node_id,
+                        "role": self.llm.role,
+                        "frequency": 0,
+                        "placeholder_len": placeholder_len,
+                        "accumulate_len": accumulate_len,
+                        "anchor_count_before": anchor_count_before,
+                        "anchor_count_after": len(anchor_store[ph_id_list[i]]),
+                        "reason": "new_anchor",
+                    }
                 )
             else:
                 anchor_store[ph_id_list[i]][message].update(entry)
@@ -1222,8 +1587,8 @@ class KVCOMMEngine:
 
         if "user_question" in ph_id:
             return (
-                shared_memory["input"][message][-1],
-                shared_memory["input_ids"][message][-1],
+                _move_tensor_tree(shared_memory["input"][message][-1], self._compute_device()),
+                _move_tensor_tree(shared_memory["input_ids"][message][-1], self._compute_device()),
                 shared_memory["input_drop_num"][message][-1],
             )
 
@@ -1254,7 +1619,11 @@ class KVCOMMEngine:
                 f"fetch_shared_cache: placeholder {ph_id} for message='{message}' not found."
             )
 
-        return ph_cache, ph_cache_ids, drop_num
+        return (
+            _move_tensor_tree(ph_cache, self._compute_device()),
+            _move_tensor_tree(ph_cache_ids, self._compute_device()),
+            drop_num,
+        )
 
     @staticmethod
     def trim_token_ids(ids_dict: Dict[str, torch.Tensor], drop_num: int) -> Dict[str, torch.Tensor]:

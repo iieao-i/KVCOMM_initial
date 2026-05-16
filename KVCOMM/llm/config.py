@@ -18,8 +18,11 @@ class KVCommConfig:
     threshold: float = 0.3
     max_anchor_num: int = 20
     window_size: int = 5
+    top_k: int | None = None
     thread_pool_workers: int = 8
     worker_timeout: float = 30.0
+    resident_anchor_summary: str | None = None
+    resident_anchor_top_n: int = 0
 
     @classmethod
     def from_env(cls) -> "KVCommConfig":
@@ -28,8 +31,15 @@ class KVCommConfig:
             threshold=float(os.environ.get("THRESHOLD", cls.threshold)),
             max_anchor_num=int(os.environ.get("MAX_ANCHOR_NUM", cls.max_anchor_num)),
             window_size=int(os.environ.get("WINDOW_SIZE", cls.window_size)),
+            top_k=(
+                int(os.environ.get("KVCOMM_TOP_K", os.environ.get("TOP_K")))
+                if os.environ.get("KVCOMM_TOP_K", os.environ.get("TOP_K")) is not None
+                else cls.top_k
+            ),
             thread_pool_workers=int(os.environ.get("KVCOMM_THREAD_WORKERS", cls.thread_pool_workers)),
             worker_timeout=float(os.environ.get("KVCOMM_WORKER_TIMEOUT", cls.worker_timeout)),
+            resident_anchor_summary=os.environ.get("KVCOMM_RESIDENT_ANCHOR_SUMMARY"),
+            resident_anchor_top_n=int(os.environ.get("KVCOMM_RESIDENT_ANCHOR_TOP_N", cls.resident_anchor_top_n)),
         ).validate()
 
     def apply_overrides(self, **overrides: Any) -> "KVCommConfig":
@@ -43,8 +53,12 @@ class KVCommConfig:
 
     def validate(self) -> "KVCommConfig":
         """Validate value ranges and return self."""
+        if self.top_k is not None and self.top_k <= 0:
+            raise ValueError("top_k must be positive when provided")
         if self.thread_pool_workers <= 0:
             raise ValueError("thread_pool_workers must be positive")
         if self.worker_timeout <= 0:
             raise ValueError("worker_timeout must be positive")
+        if self.resident_anchor_top_n < 0:
+            raise ValueError("resident_anchor_top_n must be non-negative")
         return self
